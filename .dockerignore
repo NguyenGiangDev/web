@@ -1,0 +1,5 @@
+node_modules
+node_dockerfile
+.git
+*.md
+.env*
