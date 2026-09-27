@@ -62,7 +62,9 @@ jobs:
 
           gh workflow run "$TF_WORKFLOW" \
             --repo "$TF_REPO_OWNER/$TF_REPO_NAME" \
-            --field environment="${{ env.ENV }}"
+            --field environment="${{ env.ENV }}" \
+            --field app_name="${{ env.APP_NAME }}" \
+            --field aws_region="${{ env.AWS_REGION }}"
 
           echo "Workflow triggered. Waiting 10s for GitHub to register the run..."
           sleep 10
