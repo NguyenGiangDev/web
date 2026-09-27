@@ -1,0 +1,225 @@
+# ─── web-ecr-deploy.yml ───────────────────────────────────────────────────────
+# Mục đích : Tạo ECR repos (qua Terraform-template) → Build & Push Docker images
+#             cho web service (node app + nginx reverse proxy)
+#
+# Cách dùng: Actions → "Web — ECR Provision & Image Push" → Run workflow
+#
+# Flow:
+#   1. Trigger terraform-ecr-apply.yml ở NguyenGiangDev/Terraform-template
+#      → Terraform tạo ECR repos: {env}-{APP_NAME}-app
+#                                  {env}-{APP_NAME}-nginx
+#   2. Poll cho đến khi workflow Terraform hoàn thành (tối đa 15 phút)
+#   3. Build & Push node-app image  → ECR app repo
+#   4. Build & Push nginx image     → ECR nginx repo
+#
+# GitHub Secrets cần thiết (repo này):
+#   AWS_ACCESS_KEY_ID          - AWS credentials (quyền ECR push/pull)
+#   AWS_SECRET_ACCESS_KEY      - AWS credentials
+#   TF_TRIGGER_TOKEN           - GitHub PAT với quyền "actions: write"
+#                                trên repo NguyenGiangDev/Terraform-template
+#
+# Lưu ý: VPC_ID, PRIVATE_SUBNET_IDS, PUBLIC_SUBNET_IDS, ECS_CLUSTER_ID,
+#   ECS_CLUSTER_NAME là secrets của Terraform-template repo — không cần ở đây.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "test"
+        type: choice
+        options: [test]
+
+env:
+  AWS_REGION:    ap-southeast-1
+  APP_NAME:      web
+  ENV:           ${{ inputs.environment }}
+  TF_REPO_OWNER: NguyenGiangDev
+  TF_REPO_NAME:  Terraform-template
+  TF_WORKFLOW:   terraform-ecr-apply.yml
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Trigger terraform-ecr-apply.yml ở Terraform-template
+  #         và poll đến khi nó hoàn thành
+  # ─────────────────────────────────────────────────────────────────────────────
+  provision-ecr:
+    name: "Provision ECR (via Terraform-template)"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      app_repo_url:   ${{ steps.get-ecr-urls.outputs.app_repo_url }}
+      nginx_repo_url: ${{ steps.get-ecr-urls.outputs.nginx_repo_url }}
+
+    steps:
+      - name: Trigger terraform-ecr-apply.yml
+        id: trigger
+        env:
+          GH_TOKEN: ${{ secrets.TF_TRIGGER_TOKEN }}
+        run: |
+          echo "Triggering $TF_WORKFLOW on $TF_REPO_OWNER/$TF_REPO_NAME ..."
+
+          # Lưu timestamp trước khi trigger để tìm đúng run được tạo ra
+          BEFORE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "before=$BEFORE" >> $GITHUB_OUTPUT
+
+          gh workflow run "$TF_WORKFLOW" \
+            --repo "$TF_REPO_OWNER/$TF_REPO_NAME" \
+            --field environment="${{ env.ENV }}"
+
+          echo "Workflow triggered. Waiting 10s for GitHub to register the run..."
+          sleep 10
+
+      - name: Poll until terraform-ecr-apply completes
+        id: poll
+        env:
+          GH_TOKEN: ${{ secrets.TF_TRIGGER_TOKEN }}
+        run: |
+          MAX_WAIT=900   # 15 phút
+          INTERVAL=20    # poll mỗi 20 giây
+          ELAPSED=0
+
+          echo "Polling for workflow run created after ${{ steps.trigger.outputs.before }} ..."
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RUN_JSON=$(gh run list \
+              --repo "$TF_REPO_OWNER/$TF_REPO_NAME" \
+              --workflow "$TF_WORKFLOW" \
+              --limit 5 \
+              --json databaseId,status,conclusion,createdAt \
+              2>/dev/null)
+
+            RUN_ID=$(echo "$RUN_JSON" | jq -r --arg before "${{ steps.trigger.outputs.before }}" \
+              '[.[] | select(.createdAt >= $before)] | first | .databaseId // empty')
+
+            if [ -z "$RUN_ID" ]; then
+              echo "[${ELAPSED}s] Run chưa xuất hiện, chờ thêm..."
+              sleep $INTERVAL
+              ELAPSED=$((ELAPSED + INTERVAL))
+              continue
+            fi
+
+            STATUS=$(echo "$RUN_JSON" | jq -r --arg id "$RUN_ID" \
+              '.[] | select(.databaseId == ($id | tonumber)) | .status')
+            CONCLUSION=$(echo "$RUN_JSON" | jq -r --arg id "$RUN_ID" \
+              '.[] | select(.databaseId == ($id | tonumber)) | .conclusion // empty')
+
+            echo "[${ELAPSED}s] Run #$RUN_ID — status=$STATUS conclusion=$CONCLUSION"
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+                echo "✅ Terraform ECR workflow hoàn thành thành công."
+                exit 0
+              else
+                echo "❌ Terraform ECR workflow kết thúc với: $CONCLUSION"
+                echo "   Xem chi tiết: https://github.com/$TF_REPO_OWNER/$TF_REPO_NAME/actions/runs/$RUN_ID"
+                exit 1
+              fi
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "❌ Timeout sau ${MAX_WAIT}s — Terraform workflow vẫn chưa hoàn thành."
+          exit 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Derive ECR repository URLs
+        id: get-ecr-urls
+        run: |
+          # Naming convention giống Terraform-template/locals.tf:
+          #   {env}-{app_name}-app   và   {env}-{app_name}-nginx
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          APP_REPO_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ENV}-${APP_NAME}-app"
+          NGINX_REPO_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ENV}-${APP_NAME}-nginx"
+
+          echo "app_repo_url=$APP_REPO_URL"   >> $GITHUB_OUTPUT
+          echo "nginx_repo_url=$NGINX_REPO_URL" >> $GITHUB_OUTPUT
+
+          echo "📦 ECR URLs:"
+          echo "  app   → $APP_REPO_URL"
+          echo "  nginx → $NGINX_REPO_URL"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Build & Push Docker images lên ECR
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: "Build & Push Docker images → ECR"
+    runs-on: ubuntu-latest
+    needs: provision-ecr
+    environment: ${{ inputs.environment }}
+
+    env:
+      APP_REPO:   ${{ needs.provision-ecr.outputs.app_repo_url }}
+      NGINX_REPO: ${{ needs.provision-ecr.outputs.nginx_repo_url }}
+      IMAGE_TAG:  ${{ github.sha }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build & Push: node-app image ─────────────────────────────────────────
+      # Build context: web/  (server.js, package.json, .dockerignore)
+      # Dockerfile:    web/node_dockerfile/Dockerfile
+      - name: Build & Push node-app image
+        uses: docker/build-push-action@v6
+        with:
+          context:    web
+          file:       web/node_dockerfile/Dockerfile
+          push:       true
+          tags: |
+            ${{ env.APP_REPO }}:${{ env.IMAGE_TAG }}
+            ${{ env.APP_REPO }}:latest
+          cache-from: type=registry,ref=${{ env.APP_REPO }}:cache
+          cache-to:   type=registry,ref=${{ env.APP_REPO }}:cache,mode=max
+
+      # ── Build & Push: nginx image ─────────────────────────────────────────────
+      # Build context: web/nginx_dockerfile/
+      # Dockerfile:    web/nginx_dockerfile/Dockerfile
+      - name: Build & Push nginx image
+        uses: docker/build-push-action@v6
+        with:
+          context:    web/nginx_dockerfile
+          file:       web/nginx_dockerfile/Dockerfile
+          push:       true
+          tags: |
+            ${{ env.NGINX_REPO }}:${{ env.IMAGE_TAG }}
+            ${{ env.NGINX_REPO }}:latest
+          cache-from: type=registry,ref=${{ env.NGINX_REPO }}:cache
+          cache-to:   type=registry,ref=${{ env.NGINX_REPO }}:cache,mode=max
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Web ECR Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Image    | Repository | Tag |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| node-app | \`$APP_REPO\` | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nginx    | \`$NGINX_REPO\` | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
