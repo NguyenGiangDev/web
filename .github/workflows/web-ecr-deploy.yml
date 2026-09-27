@@ -12,12 +12,6 @@
 #   3. Build & Push node-app image  → ECR app repo
 #   4. Build & Push nginx image     → ECR nginx repo
 #
-# GitHub Secrets cần thiết (repo này):
-#   AWS_ACCESS_KEY_ID          - AWS credentials (quyền ECR push/pull)
-#   AWS_SECRET_ACCESS_KEY      - AWS credentials
-#   TF_TRIGGER_TOKEN           - GitHub PAT với quyền "actions: write"
-#                                trên repo NguyenGiangDev/Terraform-template
-#
 # Lưu ý: VPC_ID, PRIVATE_SUBNET_IDS, PUBLIC_SUBNET_IDS, ECS_CLUSTER_ID,
 #   ECS_CLUSTER_NAME là secrets của Terraform-template repo — không cần ở đây.
 # ─────────────────────────────────────────────────────────────────────────────
