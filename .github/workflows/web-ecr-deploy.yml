@@ -185,8 +185,8 @@ jobs:
       - name: Build & Push node-app image
         uses: docker/build-push-action@v6
         with:
-          context:    web
-          file:       web/node_dockerfile/Dockerfile
+          context:    .
+          file:       node_dockerfile/Dockerfile
           push:       true
           tags: |
             ${{ env.APP_REPO }}:${{ env.IMAGE_TAG }}
@@ -200,8 +200,8 @@ jobs:
       - name: Build & Push nginx image
         uses: docker/build-push-action@v6
         with:
-          context:    web/nginx_dockerfile
-          file:       web/nginx_dockerfile/Dockerfile
+          context:    nginx_dockerfile
+          file:       nginx_dockerfile/Dockerfile
           push:       true
           tags: |
             ${{ env.NGINX_REPO }}:${{ env.IMAGE_TAG }}
